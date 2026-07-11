@@ -6,7 +6,9 @@ import (
     "fmt"
     "net/http"
 	"os"
-	"io"
+	"strings"
+	"bufio"
+//	"io"
 )
 
 type ChatRequest struct {
@@ -15,24 +17,29 @@ type ChatRequest struct {
 type GroqRequest struct {
 	Model    string        `json:"model"`
 	Messages []GroqMessage `json:"messages"`
+	Stream bool            `json:"stream"`
 }
 type GroqMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
-type GroqResponse struct {
-	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	} `json:"choices"`
-}
+
 
 var conversationHistory = []GroqMessage{
 	{Role: "system", Content: "You are a concise technical assistant."},
 }
 
 func handleChat(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+    w.Header().Set("Cache-Control", "no-cache")
+    w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+    if !ok {
+        http.Error(w, "streaming not supported", http.StatusInternalServerError)
+        return
+    }
+
     var req ChatRequest
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
         http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -42,9 +49,11 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
     Role:    "user",
     Content: req.Message,
     })
+
 	groqReq := GroqRequest{
 		Model: "llama-3.3-70b-versatile",
 		Messages: conversationHistory,
+		Stream: true,
 	}
 
 	body, _ := json.Marshal(groqReq)
@@ -59,25 +68,58 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
-	// temporary debug - remove later
-bodyBytes, _ := io.ReadAll(resp.Body)
-//fmt.Println("groq raw response:", string(bodyBytes))
 
-	// step 5: decode groq's response
-	var groqResp GroqResponse
-	json.Unmarshal(bodyBytes, &groqResp)
-	if len(groqResp.Choices) == 0 {
-    http.Error(w, "no response from groq", http.StatusInternalServerError)
-    return
+
+	scanner := bufio.NewScanner(resp.Body)
+var fullResponse string
+
+for scanner.Scan() {
+    line := scanner.Text()
+  //  fmt.Println("LINE:", line)
+
+    // skip empty lines
+    if line == "" {
+        continue
     }
-	
-    conversationHistory = append(conversationHistory, GroqMessage{
-    Role:    "assistant",
-    Content: groqResp.Choices[0].Message.Content,
-    })
 
-	// step 6: return the answer
-	fmt.Fprintln(w, groqResp.Choices[0].Message.Content)
+    // strip the "data: " prefix
+    if !strings.HasPrefix(line, "data: ") {
+        continue
+    }
+    line = strings.TrimPrefix(line, "data: ")
+
+    // end of stream
+    if line == "[DONE]" {
+        break
+    }
+
+    // parse the chunk
+    var chunk struct {
+        Choices []struct {
+            Delta struct {
+                Content string `json:"content"`
+            } `json:"delta"`
+        } `json:"choices"`
+    }
+    if err := json.Unmarshal([]byte(line), &chunk); err != nil {
+        continue
+    }
+
+    if len(chunk.Choices) == 0 {
+        continue
+    }
+
+    token := chunk.Choices[0].Delta.Content
+    fullResponse += token
+
+    // write and flush immediately
+    fmt.Fprint(w, token)
+    flusher.Flush()
+}	
+conversationHistory = append(conversationHistory, GroqMessage{
+    Role:    "assistant",
+    Content: fullResponse,
+})
 
    }
 
